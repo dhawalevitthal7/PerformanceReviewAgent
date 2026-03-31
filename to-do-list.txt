@@ -1,0 +1,18 @@
+organisation->manager->employee
+1) employee dont need to write their own okrs 
+2) ceo will define organisational okrs
+3) manager will define departmental okr
+4) empployee will recieve their okrs from manager
+5) constellaions implement karna hai ki kaun kaise align hai 
+	okrs ke sath
+6) department ka alignment bhi dekh sakte hai constellation me 
+7) employee ka alignment bhi dekh sakte hai constellation me
+8) if koi tool use na kar rahe ho to hume human intervention bhi 
+   lana padega jisme employee unka key results aur progress bata paye
+9) aur employee ne jo results bataye vo review karega manager
+10) manager reviiew karega aur fir edit kar ssakega usko aur updated 
+aur reviewd version of progress of eemployee, us employee ko dikhegi
+11) ceo department, manager, employee sabka kam dekh sakega
+12) getjop ko aur study karo
+13) manager can give rating also 
+14) weekly chekins karega manager 1:1
