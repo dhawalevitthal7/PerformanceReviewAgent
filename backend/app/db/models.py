@@ -9,6 +9,7 @@ from app.db.database import Base
 class UserRole(str, enum.Enum):
     EMPLOYEE = "employee"
     MANAGER = "manager"
+    CEO = "ceo"
 
 
 class CheckInMood(str, enum.Enum):
@@ -24,6 +25,30 @@ class ReviewStatus(str, enum.Enum):
     COMPLETED = "completed"
 
 
+class SubmissionStatus(str, enum.Enum):
+    PENDING_REVIEW = "pending_review"
+    APPROVED = "approved"
+    OVERRIDDEN = "overridden"
+
+
+class MeetingStatus(str, enum.Enum):
+    SCHEDULED = "scheduled"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+
+
+# Store role as VARCHAR of enum *values* (employee, manager, ceo) with no SQLite CHECK
+# so adding CEO does not require migrating old CHECK constraints on existing dev DBs.
+_USER_ROLE_STR = SQLEnum(
+    UserRole,
+    native_enum=False,
+    length=32,
+    values_callable=lambda x: [e.value for e in x],
+    validate_strings=True,
+    create_constraint=False,
+)
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -34,10 +59,18 @@ class User(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     profile = relationship("Profile", back_populates="user", uselist=False)
-    okrs = relationship("OKR", back_populates="user", cascade="all, delete-orphan")
+    okrs = relationship(
+        "OKR", back_populates="user",
+        foreign_keys="OKR.user_id",
+        cascade="all, delete-orphan",
+    )
     checkins = relationship("CheckIn", back_populates="user", cascade="all, delete-orphan")
     assessments = relationship("Assessment", back_populates="user", cascade="all, delete-orphan")
-    reviews = relationship("Review", back_populates="user", cascade="all, delete-orphan")
+    reviews = relationship(
+        "Review", back_populates="user",
+        foreign_keys="Review.user_id",
+        cascade="all, delete-orphan",
+    )
 
 
 class Profile(Base):
@@ -46,7 +79,7 @@ class Profile(Base):
     id = Column(String, primary_key=True, index=True)
     user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False)
     full_name = Column(String, nullable=False)
-    role = Column(SQLEnum(UserRole), nullable=False)
+    role = Column(_USER_ROLE_STR, nullable=False)
     department = Column(String, nullable=False)
     company_name = Column(String, nullable=False)
     company_code = Column(String, nullable=False)
@@ -75,6 +108,39 @@ class Department(Base):
                              cascade="all, delete-orphan")
 
 
+class OrganizationOKR(Base):
+    """Company-level OKR owned by the CEO tier."""
+    __tablename__ = "organization_okrs"
+
+    id = Column(String, primary_key=True, index=True)
+    company_code = Column(String, nullable=False, index=True)
+    objective = Column(Text, nullable=False)
+    quarter = Column(String, nullable=False)
+    due_date = Column(DateTime(timezone=True), nullable=False)
+    created_by = Column(String, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    key_results = relationship("OrgKeyResult", back_populates="org_okr",
+                               cascade="all, delete-orphan")
+    dept_children = relationship("DepartmentOKR", back_populates="parent_org_okr")
+
+
+class OrgKeyResult(Base):
+    __tablename__ = "org_key_results"
+
+    id = Column(String, primary_key=True, index=True)
+    org_okr_id = Column(String, ForeignKey("organization_okrs.id", ondelete="CASCADE"),
+                        nullable=False, index=True)
+    title = Column(String, nullable=False)
+    target = Column(Float, nullable=False)
+    unit = Column(String, nullable=False)
+    due_date = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    org_okr = relationship("OrganizationOKR", back_populates="key_results")
+
+
 class DepartmentOKR(Base):
     """Quarterly OKR defined by a Manager at the department level."""
     __tablename__ = "department_okrs"
@@ -88,6 +154,8 @@ class DepartmentOKR(Base):
     created_by = Column(String, ForeignKey("users.id"), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    parent_org_okr_id = Column(String, ForeignKey("organization_okrs.id"), nullable=True)
+    parent_org_okr = relationship("OrganizationOKR", back_populates="dept_children")
 
     department = relationship("Department", back_populates="dept_okrs")
     key_results = relationship("DepartmentKeyResult", back_populates="dept_okr",
@@ -121,8 +189,9 @@ class OKR(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     # New: optional link to a parent Department OKR for cascading
     parent_dept_okr_id = Column(String, ForeignKey("department_okrs.id"), nullable=True)
+    assigned_by = Column(String, ForeignKey("users.id"), nullable=True)
 
-    user = relationship("User", back_populates="okrs")
+    user = relationship("User", back_populates="okrs", foreign_keys=[user_id])
     key_results = relationship("KeyResult", back_populates="okr", cascade="all, delete-orphan")
     parent_dept_okr = relationship("DepartmentOKR", foreign_keys=[parent_dept_okr_id])
 
@@ -181,10 +250,14 @@ class Review(Base):
     improvements = Column(Text, nullable=False)     # JSON array stored as text
     score = Column(Float, nullable=False)
     status = Column(SQLEnum(ReviewStatus), default=ReviewStatus.PENDING)
+    manager_rating = Column(Float, nullable=True)
+    manager_rating_note = Column(Text, nullable=True)
+    manager_rated_by = Column(String, ForeignKey("users.id"), nullable=True)
+    manager_rated_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
-    user = relationship("User", back_populates="reviews")
+    user = relationship("User", back_populates="reviews", foreign_keys=[user_id])
     feedbacks = relationship("ReviewFeedback", back_populates="review",
                              cascade="all, delete-orphan")
 
@@ -236,6 +309,40 @@ class KPIRecord(Base):
     raw_row = Column(Text, nullable=True)            # original CSV row as JSON string
 
     dataset = relationship("KPIDataset", back_populates="records")
+
+
+class ProgressSubmission(Base):
+    __tablename__ = "progress_submissions"
+
+    id = Column(String, primary_key=True, index=True)
+    key_result_id = Column(String, ForeignKey("key_results.id", ondelete="CASCADE"),
+                         nullable=False, index=True)
+    submitted_by = Column(String, ForeignKey("users.id"), nullable=False)
+    reviewed_by = Column(String, ForeignKey("users.id"), nullable=True)
+    employee_value = Column(Float, nullable=False)
+    manager_value = Column(Float, nullable=True)
+    employee_note = Column(Text, nullable=True)
+    manager_note = Column(Text, nullable=True)
+    status = Column(SQLEnum(SubmissionStatus), default=SubmissionStatus.PENDING_REVIEW)
+    submitted_at = Column(DateTime(timezone=True), server_default=func.now())
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
+
+    key_result = relationship("KeyResult")
+
+
+class OneOnOneMeeting(Base):
+    __tablename__ = "one_on_one_meetings"
+
+    id = Column(String, primary_key=True, index=True)
+    manager_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+    employee_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+    scheduled_at = Column(DateTime(timezone=True), nullable=False)
+    agenda = Column(Text, nullable=True)
+    notes = Column(Text, nullable=True)
+    action_items = Column(Text, nullable=True)
+    status = Column(SQLEnum(MeetingStatus), default=MeetingStatus.SCHEDULED)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
 
 class IntegrationConfig(Base):

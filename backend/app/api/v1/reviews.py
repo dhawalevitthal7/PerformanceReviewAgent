@@ -15,17 +15,28 @@ from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 import json
 
 from app.db.database import get_db
 from app.db.models import (
-    Review, ReviewStatus, ReviewFeedback,
-    User, Profile, OKR, Assessment, CheckIn,
-    KPIDataset, KPIRecord,
+    Review,
+    ReviewStatus,
+    ReviewFeedback,
+    User,
+    Profile,
+    OKR,
+    Assessment,
+    CheckIn,
+    KPIDataset,
+    KPIRecord,
+    ProgressSubmission,
+    SubmissionStatus,
+    OneOnOneMeeting,
+    UserRole,
 )
-from app.api.v1.dependencies import get_current_user
+from app.api.v1.dependencies import get_current_user, require_manager
 from app.services.azure_openai_service import AzureOpenAIService
 from app.services.srs_workflow_service import (
     build_review_evidence_payload,
@@ -46,11 +57,19 @@ class ReviewResponse(BaseModel):
     score: float
     status: ReviewStatus
     workflow_metadata: Optional[dict] = None
+    manager_rating: Optional[float] = None
+    manager_rating_note: Optional[str] = None
+    manager_rated_at: Optional[datetime] = None
     created_at: datetime
     updated_at: Optional[datetime]
 
     class Config:
         from_attributes = True
+
+
+class ManagerRatingUpdate(BaseModel):
+    rating: float
+    note: Optional[str] = None
 
 
 class ReviewStatusUpdate(BaseModel):
@@ -73,6 +92,10 @@ class ReviewFeedbackResponse(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _is_leadership(profile: Profile | None) -> bool:
+    return bool(profile and profile.role in (UserRole.MANAGER, UserRole.CEO))
+
+
 def _parse_review(review: Review) -> ReviewResponse:
     """Convert a Review ORM object to a ReviewResponse, safely parsing JSON arrays."""
     return ReviewResponse(
@@ -83,9 +106,73 @@ def _parse_review(review: Review) -> ReviewResponse:
         improvements=json.loads(review.improvements) if isinstance(review.improvements, str) else review.improvements,
         score=review.score,
         status=review.status,
+        manager_rating=getattr(review, "manager_rating", None),
+        manager_rating_note=getattr(review, "manager_rating_note", None),
+        manager_rated_at=getattr(review, "manager_rated_at", None),
         created_at=review.created_at,
         updated_at=review.updated_at,
     )
+
+
+def _progress_submission_evidence(db: Session, target_user_id: str) -> list[dict]:
+    rows = (
+        db.query(ProgressSubmission)
+        .filter(
+            ProgressSubmission.submitted_by == target_user_id,
+            ProgressSubmission.status.in_(
+                (SubmissionStatus.APPROVED, SubmissionStatus.OVERRIDDEN)
+            ),
+        )
+        .order_by(ProgressSubmission.submitted_at.desc())
+        .limit(25)
+        .all()
+    )
+    out: list[dict] = []
+    for s in rows:
+        final_v = s.manager_value if s.status == SubmissionStatus.OVERRIDDEN else s.employee_value
+        out.append(
+            {
+                "key_result_id": s.key_result_id,
+                "employee_value": s.employee_value,
+                "final_value": final_v,
+                "status": s.status.value if hasattr(s.status, "value") else str(s.status),
+                "employee_note": s.employee_note,
+                "manager_note": s.manager_note,
+                "submitted_at": s.submitted_at.isoformat() if s.submitted_at else None,
+                "reviewed_at": s.reviewed_at.isoformat() if s.reviewed_at else None,
+            }
+        )
+    return out
+
+
+def _one_on_one_evidence(db: Session, target_user_id: str) -> list[dict]:
+    rows = (
+        db.query(OneOnOneMeeting)
+        .filter(OneOnOneMeeting.employee_id == target_user_id)
+        .order_by(OneOnOneMeeting.scheduled_at.desc())
+        .limit(12)
+        .all()
+    )
+    return [
+        {
+            "scheduled_at": m.scheduled_at.isoformat() if m.scheduled_at else None,
+            "agenda": m.agenda,
+            "notes": m.notes,
+            "action_items": m.action_items,
+            "status": m.status.value if hasattr(m.status, "value") else str(m.status),
+        }
+        for m in rows
+        if m.notes or m.agenda or m.action_items
+    ]
+
+
+def _enrich_evidence_for_user(db: Session, evidence_payload: dict, target_user_id: str) -> None:
+    subs = _progress_submission_evidence(db, target_user_id)
+    if subs:
+        evidence_payload["progress_submissions"] = subs
+    one_on_ones = _one_on_one_evidence(db, target_user_id)
+    if one_on_ones:
+        evidence_payload["one_on_one_meetings"] = one_on_ones
 
 
 def _get_kpi_summary(target_user_email: str, company_code: str, db: Session) -> list[dict]:
@@ -130,9 +217,9 @@ async def get_reviews(
     if not profile:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
 
-    is_manager = profile.role.value == "manager"
+    is_leadership = _is_leadership(profile)
 
-    if is_manager and user_id:
+    if is_leadership and user_id:
         # Verify target is in the same company
         target_profile = db.query(Profile).filter(Profile.user_id == user_id).first()
         if not target_profile or target_profile.company_code != profile.company_code:
@@ -142,7 +229,7 @@ async def get_reviews(
             )
         reviews = db.query(Review).filter(Review.user_id == user_id).order_by(Review.created_at.desc()).all()
 
-    elif is_manager:
+    elif is_leadership:
         # All employee reviews in this company
         employee_ids = [
             p.user_id for p in db.query(Profile).filter(
@@ -183,9 +270,7 @@ async def get_review(
     if not profile:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
 
-    is_manager = profile.role.value == "manager"
-
-    if not is_manager:
+    if not _is_leadership(profile):
         if review.user_id != current_user.id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
     else:
@@ -215,7 +300,7 @@ async def generate_review(
 
     # Permission check
     profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
-    if user_id and (not profile or profile.role.value != "manager"):
+    if user_id and not _is_leadership(profile):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only managers can generate reviews for other users",
@@ -246,6 +331,7 @@ async def generate_review(
     )
     if kpi_summary:
         evidence_payload["kpi_data"] = kpi_summary
+    _enrich_evidence_for_user(db, evidence_payload, target_user_id)
 
     ai_service = AzureOpenAIService()
     ai_review = ai_service.generate_review(evidence_payload)
@@ -299,7 +385,7 @@ async def regenerate_review_with_feedback(
       "Focus more on KPI X achievement and add clearer improvement suggestions."
     """
     profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
-    if not profile or profile.role.value != "manager":
+    if not _is_leadership(profile):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only managers can regenerate reviews",
@@ -345,6 +431,7 @@ async def regenerate_review_with_feedback(
     # Inject KPI data + manager's feedback + prior summary into the evidence
     if kpi_summary:
         evidence_payload["kpi_data"] = kpi_summary
+    _enrich_evidence_for_user(db, evidence_payload, target_user_id)
     evidence_payload["manager_feedback"] = request.feedback.strip()
     evidence_payload["previous_summary"] = review.summary
 
@@ -378,7 +465,7 @@ async def get_review_feedbacks(
 ):
     """Get the feedback/regeneration history for a review. Managers only."""
     profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
-    if not profile or profile.role.value != "manager":
+    if not _is_leadership(profile):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Managers only")
 
     feedbacks = (
@@ -401,7 +488,7 @@ async def update_review_status(
 ):
     """Manager updates the status of a review (pending → submitted → completed)."""
     profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
-    if not profile or profile.role.value != "manager":
+    if not _is_leadership(profile):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only managers can update review status",
@@ -415,4 +502,41 @@ async def update_review_status(
     db.commit()
     db.refresh(review)
 
+    return _parse_review(review)
+
+
+@router.put("/{review_id}/manager-rating", response_model=ReviewResponse)
+async def set_manager_rating(
+    review_id: str,
+    body: ManagerRatingUpdate,
+    current_user: User = Depends(require_manager),
+    db: Session = Depends(get_db),
+):
+    """Manager or CEO submits a 1–5 star rating and optional note; marks review completed."""
+    if body.rating < 1.0 or body.rating > 5.0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="rating must be between 1 and 5",
+        )
+
+    actor = db.query(Profile).filter(Profile.user_id == current_user.id).first()
+    if not actor:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
+
+    review = db.query(Review).filter(Review.id == review_id).first()
+    if not review:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Review not found")
+
+    owner = db.query(Profile).filter(Profile.user_id == review.user_id).first()
+    if not owner or owner.company_code != actor.company_code:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+
+    review.manager_rating = round(float(body.rating), 1)
+    review.manager_rating_note = body.note
+    review.manager_rated_by = current_user.id
+    review.manager_rated_at = datetime.now(timezone.utc)
+    review.status = ReviewStatus.COMPLETED
+
+    db.commit()
+    db.refresh(review)
     return _parse_review(review)

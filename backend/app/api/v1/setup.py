@@ -94,6 +94,30 @@ async def complete_manager_setup(
     return {"message": "Manager setup complete", "is_setup_done": True}
 
 
+@router.post("/ceo")
+async def complete_ceo_setup(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    CEO calls this after configuring tools (optional) and creating departments.
+    Sets is_setup_done = True on their profile.
+    """
+    profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
+    if not profile:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
+    if profile.role != UserRole.CEO:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only CEOs use this endpoint",
+        )
+
+    profile.is_setup_done = True
+    db.commit()
+    db.refresh(profile)
+
+    return {"message": "CEO setup complete", "is_setup_done": True}
+
 @router.post("/employee")
 async def complete_employee_setup(
     data: EmployeeSetupRequest,

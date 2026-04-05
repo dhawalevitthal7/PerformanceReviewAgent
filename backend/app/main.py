@@ -5,35 +5,53 @@ from sqlalchemy import text
 from app.api.v1 import (
     auth, okrs, checkins, assessments, reviews,
     team, progress, coaching,
-    departments, kpi, setup,        # NEW routers
-    ai_okr,                         # AI OKR generation
+    departments, kpi, setup,
+    ai_okr,
+    org_okrs,
+    progress_submissions,
+    one_on_ones,
+    ceo_dashboard,
 )
 from app.core.config import settings
-from app.db.database import engine, Base, SessionLocal
+from app.db.database import engine, Base, SessionLocal, switch_to_sqlite
+from app.db.sqlite_migrate import migrate_sqlite_profiles_role_if_needed
 # Import ALL models so SQLAlchemy registers them with Base.metadata
 from app.db.models import (
     User, Profile, OKR, KeyResult, CheckIn,
     Assessment, Review, ProgressHistory,
-    # New models
     Department, DepartmentOKR, DepartmentKeyResult,
     KPIDataset, KPIRecord,
     IntegrationConfig, ReviewFeedback,
+    OrganizationOKR, OrgKeyResult,
+    ProgressSubmission, OneOnOneMeeting,
 )
 
 
 def init_database():
-    """Create all tables on startup if they don't exist."""
+    """
+    Create all tables on startup.
+
+    If the configured PostgreSQL engine fails during DDL (e.g. transient DNS
+    failure after the initial probe), the module engine is swapped to SQLite
+    so the app remains fully functional for local development.
+    """
+    from app.db import database as _db_module  # re-import to get live engine ref
+
     print("=" * 60)
     print("Initializing Database...")
     print("=" * 60)
-    print(f"Database URL: {settings.DATABASE_URL}")
-    print(f"Database Type: {'SQLite' if settings.DATABASE_URL.startswith('sqlite') else 'PostgreSQL'}")
+
+    current_engine = _db_module.engine
+    db_url = str(current_engine.url)
+    print(f"Database URL: {db_url.split('@')[-1] if '@' in db_url else db_url}")
+    print(f"Database Type: {'SQLite' if db_url.startswith('sqlite') else 'PostgreSQL'}")
 
     try:
-        Base.metadata.create_all(bind=engine)
+        Base.metadata.create_all(bind=current_engine)
+        migrate_sqlite_profiles_role_if_needed(current_engine)
         print("[OK] Database tables created/verified successfully!")
 
-        db = SessionLocal()
+        db = _db_module.SessionLocal()
         try:
             db.execute(text("SELECT 1"))
             db.commit()
@@ -45,9 +63,18 @@ def init_database():
 
     except Exception as e:
         print(f"[ERROR] Error initializing database: {e}")
-        print("[WARNING] The application will start, but database operations may fail.")
-        print("[WARNING] If using Neon PostgreSQL, the host may be temporarily unreachable.")
-        print("[WARNING] Requests that need the database will return 500 until connectivity is restored.")
+        if not db_url.startswith("sqlite"):
+            # PostgreSQL failed after the initial probe — fall back to SQLite
+            switch_to_sqlite()
+            sqlite_engine = _db_module.engine
+            try:
+                Base.metadata.create_all(bind=sqlite_engine)
+                migrate_sqlite_profiles_role_if_needed(sqlite_engine)
+                print("[OK] SQLite fallback database ready.")
+            except Exception as sqlite_err:
+                print(f"[ERROR] SQLite fallback also failed: {sqlite_err}")
+        else:
+            print("[WARNING] The application will start, but database operations may fail.")
 
 
 @asynccontextmanager
@@ -90,6 +117,14 @@ app.include_router(team.router,        prefix="/api/v1/team",         tags=["Tea
 app.include_router(progress.router,    prefix="/api/v1/progress",     tags=["Progress"])
 app.include_router(coaching.router,    prefix="/api/v1/coaching",     tags=["Coaching"])
 app.include_router(ai_okr.router,      prefix="/api/v1/ai",            tags=["AI OKR"])
+app.include_router(org_okrs.router,    prefix="/api/v1/org-okrs",      tags=["Organization OKRs"])
+app.include_router(
+    progress_submissions.router,
+    prefix="/api/v1/progress-submissions",
+    tags=["Progress submissions"],
+)
+app.include_router(one_on_ones.router, prefix="/api/v1/one-on-ones",   tags=["1:1 Meetings"])
+app.include_router(ceo_dashboard.router, prefix="/api/v1/ceo",        tags=["CEO Dashboard"])
 
 
 # ── Health Endpoints ──────────────────────────────────────────────────────────

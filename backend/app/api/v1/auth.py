@@ -6,7 +6,7 @@ and demo-user provisioning.
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 from sqlalchemy import func as sa_func
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, field_validator
 from typing import List, Optional
 from datetime import timedelta
 import uuid
@@ -70,7 +70,6 @@ def _ensure_department_link_for_profile(
             id=str(uuid.uuid4()),
             name=dept_text,
             company_code=company_code,
-            created_by=profile.user_id,
         )
         db.add(dept)
         db.flush()
@@ -106,10 +105,24 @@ class UserSignUp(BaseModel):
     company_name: str
     company_code: str = ""  # optional — derived from email if blank
 
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, v: object) -> object:
+        if isinstance(v, str):
+            return v.strip().lower()
+        return v
+
 
 class UserSignIn(BaseModel):
     email: EmailStr
     password: str
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, v: object) -> object:
+        if isinstance(v, str):
+            return v.strip().lower()
+        return v
 
 
 class Token(BaseModel):
@@ -156,7 +169,9 @@ class DepartmentItem(BaseModel):
 @router.post("/signup", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
 async def signup(user_data: UserSignUp, db: Session = Depends(get_db)):
     """Register a new user with optional department linking."""
-    existing_user = db.query(User).filter(User.email == user_data.email).first()
+    existing_user = (
+        db.query(User).filter(sa_func.lower(User.email) == user_data.email).first()
+    )
     if existing_user:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -175,6 +190,12 @@ async def signup(user_data: UserSignUp, db: Session = Depends(get_db)):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Department is required for employees.",
+        )
+
+    if user_data.role == UserRole.CEO and not user_data.company_name.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Company name is required for CEO signup.",
         )
 
     # Create user
@@ -222,7 +243,9 @@ async def signup(user_data: UserSignUp, db: Session = Depends(get_db)):
 @router.post("/signin", response_model=AuthResponse)
 async def signin(credentials: UserSignIn, db: Session = Depends(get_db)):
     """Authenticate and return token. Auto-links department on the fly."""
-    user = db.query(User).filter(User.email == credentials.email).first()
+    user = (
+        db.query(User).filter(sa_func.lower(User.email) == credentials.email).first()
+    )
 
     if not user or not verify_password(credentials.password, user.hashed_password):
         raise HTTPException(
@@ -289,7 +312,7 @@ async def company_departments(
     """
     depts = (
         db.query(Department)
-        .filter(Department.company_code == email_domain.lower())
+        .filter(Department.company_code == email_domain.strip().lower())
         .order_by(Department.name)
         .all()
     )
@@ -298,11 +321,15 @@ async def company_departments(
 
 @router.post("/demo-setup")
 async def demo_setup(db: Session = Depends(get_db)):
-    """Create demo employee + manager if they don't already exist."""
+    """Create demo employee, manager, and CEO if they don't already exist."""
     created = []
-    for role_str, name in [("employee", "Demo Employee"), ("manager", "Demo Manager")]:
+    for role_str, name in [
+        ("employee", "Demo Employee"),
+        ("manager", "Demo Manager"),
+        ("ceo", "Demo CEO"),
+    ]:
         email = f"{role_str}@demo.com"
-        if db.query(User).filter(User.email == email).first():
+        if db.query(User).filter(sa_func.lower(User.email) == email).first():
             continue
         uid = str(uuid.uuid4())
         user = User(

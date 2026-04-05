@@ -4,6 +4,7 @@ Seed script to create demo users for PerformBharat.
 Run this script once to create:
   - employee@demo.com  (password: demo123)  Role: Employee
   - manager@demo.com   (password: demo123)  Role: Manager
+  - ceo@demo.com       (password: demo123)  Role: CEO
 
 Usage:
     python seed_demo_users.py
@@ -15,6 +16,8 @@ import uuid
 
 # Ensure the app package is importable
 sys.path.insert(0, os.path.dirname(__file__))
+
+from sqlalchemy import func as sa_func
 
 from app.db.database import SessionLocal, engine, Base
 from app.db.models import User, Profile, UserRole
@@ -40,6 +43,15 @@ DEMO_USERS = [
         "company_name": "PerformBharat Demo",
         "company_code": "DEMO2024",
     },
+    {
+        "email": "ceo@demo.com",
+        "password": "demo123",
+        "full_name": "Demo CEO",
+        "role": UserRole.CEO,
+        "department": "Demo Department",
+        "company_name": "Demo Inc",
+        "company_code": "demo.com",
+    },
 ]
 
 
@@ -54,7 +66,11 @@ def seed_demo_users():
 
     try:
         for user_data in DEMO_USERS:
-            existing = db.query(User).filter(User.email == user_data["email"]).first()
+            existing = (
+                db.query(User)
+                .filter(sa_func.lower(User.email) == user_data["email"].lower())
+                .first()
+            )
             if existing:
                 skipped.append(user_data["email"])
                 continue

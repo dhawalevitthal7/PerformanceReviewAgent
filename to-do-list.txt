@@ -1,6 +1,7 @@
 organisation->manager->employee
 1) employee dont need to write their own okrs 
 2) ceo will define organisational okrs
+2) ceo will initialise departments First
 3) manager will define departmental okr
 4) empployee will recieve their okrs from manager
 5) constellaions implement karna hai ki kaun kaise align hai 

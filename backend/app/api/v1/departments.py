@@ -21,8 +21,14 @@ import uuid
 
 from app.db.database import get_db
 from app.db.models import (
-    Department, DepartmentOKR, DepartmentKeyResult,
-    OKR, Profile, User, UserRole,
+    Department,
+    DepartmentOKR,
+    DepartmentKeyResult,
+    OrganizationOKR,
+    OKR,
+    Profile,
+    User,
+    UserRole,
 )
 from app.api.v1.dependencies import get_current_user
 
@@ -57,6 +63,7 @@ class DeptOKRCreate(BaseModel):
     quarter: str        # e.g. "Q2-2025"
     due_date: datetime
     key_results: List[DeptKeyResultCreate]
+    parent_org_okr_id: Optional[str] = None
 
 
 class DeptKeyResultResponse(BaseModel):
@@ -77,6 +84,7 @@ class DeptOKRResponse(BaseModel):
     quarter: str
     due_date: datetime
     created_at: datetime
+    parent_org_okr_id: Optional[str] = None
     key_results: List[DeptKeyResultResponse]
 
     class Config:
@@ -86,12 +94,12 @@ class DeptOKRResponse(BaseModel):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _get_manager_profile(current_user: User, db: Session) -> Profile:
-    """Fetch profile and assert the user is a Manager."""
+    """Fetch profile; manager or CEO may manage departments."""
     profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
-    if not profile or profile.role != UserRole.MANAGER:
+    if not profile or profile.role not in (UserRole.MANAGER, UserRole.CEO):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only managers can perform this action",
+            detail="Only managers or CEOs can perform this action",
         )
     return profile
 
@@ -232,6 +240,23 @@ async def create_department_okr(
             detail="At least one key result is required",
         )
 
+    parent_org_id: Optional[str] = None
+    if data.parent_org_okr_id:
+        org_row = (
+            db.query(OrganizationOKR)
+            .filter(
+                OrganizationOKR.id == data.parent_org_okr_id,
+                OrganizationOKR.company_code == profile.company_code,
+            )
+            .first()
+        )
+        if not org_row:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid organization OKR for this company",
+            )
+        parent_org_id = data.parent_org_okr_id
+
     okr_id = str(uuid.uuid4())
     okr = DepartmentOKR(
         id=okr_id,
@@ -240,6 +265,7 @@ async def create_department_okr(
         quarter=data.quarter.strip(),
         due_date=data.due_date,
         created_by=current_user.id,
+        parent_org_okr_id=parent_org_id,
     )
     db.add(okr)
     db.flush()

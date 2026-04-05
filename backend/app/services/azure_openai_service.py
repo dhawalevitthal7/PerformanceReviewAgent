@@ -101,6 +101,7 @@ class AzureOpenAIService:
             model=self.deployment,
             messages=messages,  # type: ignore[arg-type]
             temperature=0.7,
+            max_tokens=4000,
             response_format={"type": "json_object"},
         )
         content = (response.choices[0].message.content or "{}").strip()
@@ -162,6 +163,85 @@ class AzureOpenAIService:
             model=self.deployment,
             messages=messages,  # type: ignore[arg-type]
             temperature=0.7,
+            response_format={"type": "json_object"},
+        )
+        content = (response.choices[0].message.content or "{}").strip()
+        return json.loads(content)
+
+    def generate_okr_alignment_check(
+        self,
+        org_objective: str,
+        org_key_results: list[dict[str, Any]],
+        department_objective: str,
+        department_key_results: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """
+        Compare department OKR to company OKR. Returns JSON with aligned, gaps, recommendation.
+        """
+        system_prompt = (
+            "You are an OKR alignment reviewer. Compare a department OKR to a company OKR. "
+            "Return strict JSON with keys: aligned (boolean), gaps (array of short strings), "
+            "recommendation (one short paragraph)."
+        )
+        user_prompt = (
+            "Company OKR:\n"
+            f"  Objective: {org_objective}\n"
+            f"  Key results: {json.dumps(org_key_results)}\n\n"
+            "Department OKR:\n"
+            f"  Objective: {department_objective}\n"
+            f"  Key results: {json.dumps(department_key_results)}\n"
+        )
+        return self._complete_json(system_prompt, user_prompt)
+
+    def coach_progress_submission(self, evidence_payload: dict[str, Any]) -> dict[str, Any]:
+        """Short coaching suggestion from progress submission context."""
+        system_prompt = (
+            "You are a concise engineering manager coach. Given progress submission context, "
+            "suggest a short coaching note for the employee. "
+            "Return strict JSON with keys: coaching_note (string), flags (array of short strings)."
+        )
+        user_prompt = f"Context JSON:\n{json.dumps(evidence_payload)}"
+        return self._complete_json(system_prompt, user_prompt)
+
+    def progress_assist(
+        self,
+        kr_context: dict[str, Any],
+        message: str,
+        conversation_history: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        """
+        Conversational assistant to help employees submit progress.
+        Returns JSON with keys:
+          - reply: assistant response
+          - has_suggestion: bool
+          - suggestion: { value: number, note: string } | null
+        """
+        system_prompt = (
+            "You are a helpful OKR progress assistant for employees. "
+            "Use the key result context to ask clarifying questions. "
+            "When you have enough information, propose a numeric 'value' update "
+            "and a short 'note' (1-2 sentences) summarizing progress. "
+            "ALWAYS return strict JSON with:\n"
+            "{\n"
+            '  "reply": "<your conversational response>",\n'
+            '  "has_suggestion": true | false,\n'
+            '  "suggestion": { "value": <number>, "note": "<short summary>" } | null\n'
+            "}\n"
+        )
+        context_str = json.dumps(kr_context)
+        messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+        messages.extend(conversation_history)
+        messages.append(
+            {
+                "role": "user",
+                "content": f"Key result context JSON:\n{context_str}\n\nUser says: {message}",
+            }
+        )
+
+        response = self.client.chat.completions.create(
+            model=self.deployment,
+            messages=messages,  # type: ignore[arg-type]
+            temperature=0.5,
             response_format={"type": "json_object"},
         )
         content = (response.choices[0].message.content or "{}").strip()

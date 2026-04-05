@@ -1,6 +1,17 @@
+from pathlib import Path
+
 from pydantic_settings import BaseSettings
 import os
 import socket
+
+# Always resolve SQLite to the backend package root so the same file is used
+# regardless of whether uvicorn was started from the repo root or backend/.
+_BACKEND_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+def default_sqlite_url() -> str:
+    """Stable SQLite URL pointing at backend/performbharat.db."""
+    return f"sqlite:///{(_BACKEND_ROOT / 'performbharat.db').as_posix()}"
 
 
 def _resolve_database_url() -> str:
@@ -9,7 +20,7 @@ def _resolve_database_url() -> str:
     PostgreSQL host cannot be resolved (e.g. no internet / Neon project paused).
     This prevents a hard crash on startup during local development.
     """
-    url = os.getenv("DATABASE_URL", "sqlite:///./performbharat.db")
+    url = os.getenv("DATABASE_URL", default_sqlite_url())
 
     # Only attempt DNS validation for PostgreSQL URLs
     if url.startswith("postgresql"):
@@ -22,7 +33,7 @@ def _resolve_database_url() -> str:
                 "[WARNING] Could not resolve PostgreSQL host. "
                 "Falling back to local SQLite database."
             )
-            url = "sqlite:///./performbharat.db"
+            url = default_sqlite_url()
 
     return url
 

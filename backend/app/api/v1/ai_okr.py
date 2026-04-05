@@ -76,6 +76,25 @@ class GenerateOKRResponse(BaseModel):
     okr_suggestion: AIOKRSuggestion | None = None
 
 
+# ── Progress assist schemas ─────────────────────────────────────────────────────
+
+class ProgressAssistRequest(BaseModel):
+    key_result_id: str
+    message: str
+    conversation_history: list[ConversationMessage] = Field(default_factory=list)
+
+
+class ProgressAssistSuggestion(BaseModel):
+    value: float
+    note: str
+
+
+class ProgressAssistResponse(BaseModel):
+    reply: str
+    has_suggestion: bool
+    suggestion: ProgressAssistSuggestion | None = None
+
+
 # ── Endpoint ──────────────────────────────────────────────────────────────────
 
 @router.post("/generate-okr", response_model=GenerateOKRResponse)
@@ -106,8 +125,13 @@ async def generate_okr(
             conversation_history=history,
         )
     except Exception as exc:
-        # Log full traceback so the root cause is visible in the server console
-        logger.error("AI OKR generation failed:\n%s", traceback.format_exc())
+        trace_str = traceback.format_exc()
+        logger.error("AI OKR generation failed:\n%s", trace_str)
+        try:
+            with open("ai_error.log", "w") as f:
+                f.write(trace_str)
+        except Exception:
+            pass
         raise HTTPException(
             status_code=500,
             detail=f"AI generation failed: {type(exc).__name__}: {str(exc)}",
@@ -203,4 +227,59 @@ async def cascade_okr(
     return GenerateOKRResponse(
         reply=raw.get("reply", "Let me help you personalise this goal!"),
         okr_suggestion=suggestion,
+    )
+
+
+# ── Progress assist endpoint ───────────────────────────────────────────────────
+
+from sqlalchemy.orm import Session
+from fastapi import status
+from app.db.database import get_db
+from app.db.models import KeyResult, OKR
+
+
+@router.post("/progress-assist", response_model=ProgressAssistResponse)
+async def progress_assist(
+    request: ProgressAssistRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ProgressAssistResponse:
+    """
+    Conversational assistant for employees to prepare a progress submission.
+    Validates ownership of the key result.
+    """
+    # Ownership check
+    kr = db.query(KeyResult).filter(KeyResult.id == request.key_result_id).first()
+    if not kr:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Key result not found")
+    okr = db.query(OKR).filter(OKR.id == kr.okr_id).first()
+    if not okr or okr.user_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your key result")
+
+    try:
+        service = AzureOpenAIService()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    history = [{"role": m.role, "content": m.content} for m in request.conversation_history]
+    kr_context = {
+        "okr_objective": okr.objective,
+        "key_result": {"id": kr.id, "title": kr.title, "target": kr.target, "current": kr.current, "unit": kr.unit, "due_date": str(kr.due_date)},
+    }
+    raw = service.progress_assist(kr_context=kr_context, message=request.message, conversation_history=history)
+
+    suggestion = None
+    if raw.get("has_suggestion") and raw.get("suggestion"):
+        try:
+            suggestion = ProgressAssistSuggestion(
+                value=float(raw["suggestion"]["value"]),
+                note=str(raw["suggestion"]["note"]),
+            )
+        except Exception:
+            suggestion = None
+
+    return ProgressAssistResponse(
+        reply=str(raw.get("reply", "")) or "Noted. Tell me your latest progress.",
+        has_suggestion=bool(raw.get("has_suggestion", False)),
+        suggestion=suggestion,
     )

@@ -14,12 +14,13 @@ from app.db.models import (
     OKR,
     KeyResult,
     User,
+    Department,
     DepartmentOKR,
     DepartmentKeyResult,
     Profile,
     UserRole,
 )
-from app.api.v1.dependencies import get_current_user
+from app.api.v1.dependencies import get_current_user, require_manager
 
 router = APIRouter()
 
@@ -87,10 +88,33 @@ class OKRResponse(BaseModel):
     created_at: datetime
     due_date: datetime
     parent_dept_okr_id: Optional[str] = None
+    assigned_by: Optional[str] = None
     key_results: List[KeyResultResponse]
 
     class Config:
         from_attributes = True
+
+
+class OKRAssignCreate(BaseModel):
+    objective: str
+    due_date: datetime
+    employee_user_id: str
+    parent_dept_okr_id: Optional[str] = None
+    key_results: List[KeyResultCreate]
+
+
+def _can_manager_assign_to_employee(
+    db: Session,
+    manager_id: str,
+    employee_profile: Profile,
+    actor_role: UserRole,
+) -> bool:
+    if actor_role == UserRole.CEO:
+        return True
+    if not employee_profile.department_id:
+        return False
+    dept = db.query(Department).filter(Department.id == employee_profile.department_id).first()
+    return bool(dept and dept.manager_id == manager_id)
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -106,7 +130,8 @@ async def get_okrs(
     Get all OKRs for the current user.
     Optionally filter by quarter/year (OKRs whose date range overlaps the quarter).
     """
-    query = db.query(OKR).filter(OKR.user_id == current_user.id)
+    from sqlalchemy.orm import joinedload
+    query = db.query(OKR).options(joinedload(OKR.key_results)).filter(OKR.user_id == current_user.id)
 
     if quarter and year:
         q_start, q_end = _quarter_date_range(quarter, year)
@@ -114,6 +139,72 @@ async def get_okrs(
         query = query.filter(OKR.created_at < q_end, OKR.due_date >= q_start)
 
     return query.order_by(OKR.created_at.desc()).all()
+
+
+@router.post("/assign", response_model=OKRResponse, status_code=status.HTTP_201_CREATED)
+async def assign_okr_to_employee(
+    body: OKRAssignCreate,
+    current_user: User = Depends(require_manager),
+    db: Session = Depends(get_db),
+):
+    """
+    Manager or CEO assigns a personal OKR to a specific employee.
+    """
+    actor_profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
+    if not actor_profile:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
+
+    target_profile = db.query(Profile).filter(Profile.user_id == body.employee_user_id).first()
+    if not target_profile or target_profile.role != UserRole.EMPLOYEE:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Target user must be an employee with a profile",
+        )
+    if target_profile.company_code != actor_profile.company_code:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Employee not in your company")
+
+    if not _can_manager_assign_to_employee(db, current_user.id, target_profile, actor_profile.role):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only assign OKRs to employees in departments you manage",
+        )
+
+    if body.parent_dept_okr_id:
+        parent = db.query(DepartmentOKR).filter(DepartmentOKR.id == body.parent_dept_okr_id).first()
+        if not parent:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Department OKR not found")
+        pdept = db.query(Department).filter(Department.id == parent.department_id).first()
+        if not pdept or pdept.company_code != actor_profile.company_code:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid department OKR")
+
+    okr_id = str(uuid.uuid4())
+    okr = OKR(
+        id=okr_id,
+        user_id=body.employee_user_id,
+        objective=body.objective,
+        due_date=body.due_date,
+        parent_dept_okr_id=body.parent_dept_okr_id,
+        assigned_by=current_user.id,
+    )
+    db.add(okr)
+    db.flush()
+
+    for kr_data in body.key_results:
+        db.add(
+            KeyResult(
+                id=str(uuid.uuid4()),
+                okr_id=okr_id,
+                title=kr_data.title,
+                target=kr_data.target,
+                current=0.0,
+                unit=kr_data.unit,
+                due_date=kr_data.due_date,
+            )
+        )
+
+    db.commit()
+    db.refresh(okr)
+    return okr
 
 
 @router.get("/{okr_id}", response_model=OKRResponse)
@@ -141,6 +232,13 @@ async def create_okr(
     For managers creating a fresh goal (not cascading), mirror the goal to
     department-level OKRs so employees in the same department can cascade it.
     """
+    profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
+    if profile and profile.role == UserRole.EMPLOYEE:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Employees cannot create OKRs. Contact your manager.",
+        )
+
     okr_id = str(uuid.uuid4())
     okr = OKR(
         id=okr_id,
@@ -168,7 +266,6 @@ async def create_okr(
     # Manager-created goals from "My OKRs" should also appear as department goals.
     # Skip this when the goal is already a cascade from an existing department OKR.
     if not okr_data.parent_dept_okr_id:
-        profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
         if profile and profile.role == UserRole.MANAGER and profile.department_id:
             dept_okr_id = str(uuid.uuid4())
             dept_okr = DepartmentOKR(
@@ -193,6 +290,10 @@ async def create_okr(
                         due_date=kr_data.due_date,
                     )
                 )
+
+        elif profile and profile.role == UserRole.CEO:
+            # CEO personal OKRs are not mirrored to a department by default
+            pass
 
     db.commit()
     db.refresh(okr)
@@ -244,7 +345,14 @@ async def update_key_result(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Update a key result's current value."""
+    """Update a key result's current value (managers/CEO only — employees use progress submissions)."""
+    profile = db.query(Profile).filter(Profile.user_id == current_user.id).first()
+    if profile and profile.role == UserRole.EMPLOYEE:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Use progress submissions to update key result progress.",
+        )
+
     okr = db.query(OKR).filter(OKR.id == okr_id, OKR.user_id == current_user.id).first()
     if not okr:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="OKR not found")
